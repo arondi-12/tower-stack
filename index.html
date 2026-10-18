@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Tower Stack</title>
+<style>
+  :root { --ink:#292a23; --paper:#fffefa; --lime:#d8fd71; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--ink); color:var(--paper); font-family: system-ui, sans-serif; overflow:hidden; touch-action:manipulation; }
+  #wrap { position:relative; height:100%; max-width:420px; margin:0 auto; }
+  canvas { width:100%; height:100%; display:block; }
+  .startng-card { position:absolute; top:12px; left:12px; display:flex; align-items:center; gap:10px; padding:6px 14px 6px 6px; border-radius:999px; background:#1b1c17; }
+  .startng-card img { width:40px; height:40px; border-radius:50%; background:var(--lime); }
+  .startng-card b { display:block; font-size:15px; }
+  .startng-card span { font-size:12px; opacity:.7; }
+  .startng-card button, .btn { border:0; border-radius:999px; padding:8px 14px; background:var(--lime); color:var(--ink); font-weight:700; font-size:14px; cursor:pointer; }
+  .startng-card button { padding:5px 10px; font-size:12px; }
+  button:focus-visible { outline:3px solid var(--paper); outline-offset:2px; }
+  #score { position:absolute; top:14px; right:16px; font-size:44px; font-weight:800; line-height:1; text-align:right; }
+  #score small { display:block; font-size:12px; font-weight:500; opacity:.7; margin-top:4px; }
+  #panel { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:24px; background:rgba(41,42,35,.92); text-align:center; }
+  #panel[hidden] { display:none; }
+  #panel h1 { margin:0; font-size:34px; }
+  #panel p { margin:0; opacity:.8; max-width:30ch; }
+  #board { list-style:none; margin:0; padding:0; width:100%; max-width:300px; text-align:left; font-size:14px; }
+  #board li { display:flex; justify-content:space-between; gap:8px; padding:4px 8px; border-radius:6px; }
+  #board li.me { background:var(--lime); color:var(--ink); font-weight:700; }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior:auto; } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="360" height="600"></canvas>
+
+  <div class="startng-card" id="player-card" hidden>
+    <img id="player-face" alt="">
+    <div><b id="player-name"></b><span id="player-account"></span></div>
+    <button id="player-sign-in" hidden>Sign in</button>
+  </div>
+  <div id="score">0<small id="perfects">0 perfect</small></div>
+
+  <div id="panel">
+    <h1 id="title">Tower Stack</h1>
+    <p id="msg">Tap, click or press space to drop the block. Line it up to keep it wide.</p>
+    <ol id="board" hidden></ol>
+    <button class="btn" id="play">Play</button>
+  </div>
+</div>
+
+<script type="module">
+// ---------- start.ng connect page ----------
+const START_NG = 'https://start.ng';
+let frame;
+function connectFrame() {
+  frame ??= new Promise((resolve, reject) => {
+    const el = document.createElement('iframe');
+    el.src = `${START_NG}/connect`; el.hidden = true;
+    el.onload = () => resolve(el); el.onerror = reject;
+    document.body.append(el);
+  });
+  return frame;
+}
+async function askStartNg(message, replyType, timeoutMs = 5000) {
+  let el;
+  try { el = await connectFrame(); } catch { return null; }
+  return new Promise((resolve) => {
+    const requestId = Math.random().toString(36).slice(2);
+    const done = (r) => { clearTimeout(timer); removeEventListener('message', onMessage); resolve(r); };
+    const timer = setTimeout(() => done(null), timeoutMs);
+    function onMessage(e) {
+      if (e.origin !== START_NG || e.source !== el.contentWindow) return;
+      if (e.data?.type === replyType && e.data.requestId === requestId) done(e.data);
+    }
+    addEventListener('message', onMessage);
+    el.contentWindow.postMessage({ ...message, requestId }, START_NG);
+  });
+}
+const signInUrl = () => `https://start.ng/?return_to=${encodeURIComponent(location.origin + location.pathname)}`;
+
+let me = null; // signed-in user or null
+async function loadPlayer() {
+  const reply = await askStartNg({ type: 'startng:whoami' }, 'startng:user');
+  me = reply?.user ?? null;
+  const player = reply?.user ?? reply?.guest;
+  if (!player) return; // not on start.ng: the game still plays
+  document.getElementById('player-face').src = player.face || '';
+  document.getElementById('player-name').textContent = player.name;
+  document.getElementById('player-account').textContent = me?.account ? `@${me.account}` : 'Not signed in';
+  document.getElementById('player-sign-in').hidden = !!me;
+  document.getElementById('player-card').hidden = false;
+}
+document.getElementById('player-sign-in').onclick = () => (location.href = signInUrl());
+addEventListener('focus', loadPlayer);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) loadPlayer(); });
+loadPlayer();
+
+// ---------- game ----------
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = 360, H = 600, BH = 26, BASE_Y = 520;
+let stack, cur, cam, camTarget, perfects, running, bits, best = 0;
+const $ = (id) => document.getElementById(id);
+
+function hue(i) { return (i * 23 + 20) % 360; }
+function spawn() {
+  const top = stack[stack.length - 1];
+  const fromLeft = stack.length % 2 === 0;
+  cur = { w: top.w, x: fromLeft ? -top.w : W, dir: fromLeft ? 1 : -1, speed: Math.min(2 + stack.length * 0.12, 6.5) };
+}
+function start() {
+  stack = [{ x: 80, w: 200 }]; bits = []; perfects = 0; cam = 0; camTarget = 0; running = true;
+  $('panel').hidden = true; updateScore(); spawn();
+}
+function updateScore() {
+  $('score').firstChild.textContent = stack.length - 1;
+  $('perfects').textContent = `${perfects} perfect`;
+}
+function drop() {
+  if (!running) return;
+  const prev = stack[stack.length - 1];
+  const left = Math.max(cur.x, prev.x), right = Math.min(cur.x + cur.w, prev.x + prev.w);
+  const overlap = right - left;
+  if (overlap <= 0) { bits.push({ x: cur.x, w: cur.w, y: stack.length, vy: 0, h: hue(stack.length) }); return gameOver(); }
+  let block;
+  if (Math.abs(cur.x - prev.x) < 5) { block = { x: prev.x, w: prev.w }; perfects++; }
+  else {
+    block = { x: left, w: overlap };
+    const cutX = cur.x < prev.x ? cur.x : right, cutW = cur.w - overlap;
+    bits.push({ x: cutX, w: cutW, y: stack.length, vy: 0, h: hue(stack.length) });
+  }
+  stack.push(block);
+  camTarget = Math.max(0, (stack.length - 8) * BH);
+  updateScore(); spawn();
+}
+async function gameOver() {
+  running = false;
+  const floors = stack.length - 1;
+  best = Math.max(best, floors);
+  $('title').textContent = `${floors} floors`;
+  $('msg').textContent = me ? 'Saving your run…' : 'Sign in with start.ng to save your score.';
+  $('play').textContent = 'Play again';
+  $('panel').hidden = false;
+  if (me) {
+    const saved = await askStartNg({ type: 'startng:score', stats: { floors, perfects } }, 'startng:scoreSaved');
+    $('msg').textContent = saved?.ok
+      ? (saved.result.improved ? `New best! You're #${saved.result.rank}.` : `Not your best this time (#${saved.result.rank}).`)
+      : 'Could not save this run.';
+  } else if (!$('msg').querySelector('a')) {
+    const a = document.createElement('a'); a.href = signInUrl(); a.textContent = ' Sign in'; a.style.color = '#d8fd71';
+    $('msg').append(a);
+  }
+  showBoard();
+}
+async function showBoard() {
+  const res = await askStartNg({ type: 'startng:leaderboard', limit: 8 }, 'startng:leaderboardData');
+  const list = $('board');
+  if (!res?.ok || !res.entries?.length) { list.hidden = true; return; }
+  list.replaceChildren(...res.entries.map((e) => {
+    const li = document.createElement('li');
+    if (me && e.player_id === me.id) li.className = 'me';
+    const a = document.createElement('span'), b = document.createElement('span');
+    a.textContent = `#${e.rank} ${e.name}`;
+    b.textContent = `${e.stats.floors} floors · ${e.stats.perfects} perfect`;
+    li.append(a, b); return li;
+  }));
+  list.hidden = false;
+}
+
+function loop() {
+  if (running) {
+    cur.x += cur.dir * cur.speed;
+    if (cur.x + cur.w > W + cur.w * 0.6) cur.dir = -1;
+    if (cur.x < -cur.w * 0.6) cur.dir = 1;
+  }
+  cam += (camTarget - cam) * 0.12;
+  ctx.fillStyle = '#292a23'; ctx.fillRect(0, 0, W, H);
+  const yOf = (i) => BASE_Y - i * BH + cam;
+  stack.forEach((b, i) => {
+    ctx.fillStyle = `hsl(${hue(i)} 70% 60%)`; ctx.fillRect(b.x, yOf(i), b.w, BH - 2);
+  });
+  if (running) { ctx.fillStyle = `hsl(${hue(stack.length)} 70% 60%)`; ctx.fillRect(cur.x, yOf(stack.length), cur.w, BH - 2); }
+  bits.forEach((p) => { p.vy += 0.6; p.y -= 0; p.dy = (p.dy || 0) + p.vy;
+    ctx.fillStyle = `hsl(${p.h} 70% 60%)`; ctx.fillRect(p.x, yOf(p.y) + p.dy, p.w, BH - 2); });
+  bits = bits.filter((p) => yOf(p.y) + p.dy < H + 40);
+  requestAnimationFrame(loop);
+}
+
+stack = [{ x: 80, w: 200 }]; bits = []; cam = 0; camTarget = 0; running = false; perfects = 0;
+loop();
+$('play').onclick = start;
+cv.addEventListener('pointerdown', drop);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); if (running) drop(); else if (!$('panel').hidden) start(); }
+});
+</script>
+</body>
+</html>
